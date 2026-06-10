@@ -6,7 +6,7 @@
 
 ### Linux pentest control surface for structured recon, tool orchestration, routing control, and target-based evidence capture
 
-[![Version](https://img.shields.io/badge/version-1.3.0-ff3131?style=for-the-badge)](https://github.com/Chaos-Tic/Chaostic-Tool/releases/tag/v1.3.0)
+[![Version](https://img.shields.io/badge/version-1.3.1-ff3131?style=for-the-badge)](https://github.com/Chaos-Tic/Chaostic-Tool/releases/tag/v1.3.1)
 [![Python](https://img.shields.io/badge/python-3.11%2B-111827?style=for-the-badge&logo=python)](https://www.python.org/)
 [![UI](https://img.shields.io/badge/UI-Rich%20Terminal-ff3131?style=for-the-badge)](https://github.com/Textualize/rich)
 [![Platform](https://img.shields.io/badge/platform-Linux-111827?style=for-the-badge&logo=linux)](#supported-systems)
@@ -282,7 +282,7 @@ Presets can also define custom prompt fields through `"prompt"`.
 
 ## Release
 
-Current release: `v1.3.0`.
+Current release: `v1.3.1`.
 
 See releases: https://github.com/Chaos-Tic/Chaostic-Tool/releases
 
