@@ -9,6 +9,8 @@ cd "$SCRIPT_DIR" || exit 1
 
 PROFILE="standard"
 WITH_TOR=0
+WITH_KALI_REPO=0
+WITH_CHAOTIC_AUR=0
 ASSUME_YES=0
 NO_TOOLS=0
 REFRESH_DONE=0
@@ -30,6 +32,9 @@ Options:
                          toolchains (Go, Rust, Ruby) and clones some tools into /opt/chaostictool/. Can be slow.
                          Tor is started for the current session only — not enabled at boot.
   --with-tor             Install and configure Tor/proxychains support for minimal/standard profiles.
+  --with-kali-repo       Add Kali rolling repo on Debian/apt systems (PIN priority 100 — Debian
+                         packages remain preferred; Kali packages fill gaps). Recommended on RPi/ARM64.
+  --with-chaotic-aur     Add Chaotic-AUR repo on Arch/pacman systems (prebuilt AUR packages).
   --no-tools             Skip external pentest tools.
   -y, --yes              Accepted for compatibility; installs are non-interactive.
   -h, --help             Show this help.
@@ -39,6 +44,8 @@ Examples:
   sudo ./install.sh --profile minimal
   sudo ./install.sh --with-tor
   sudo ./install.sh --profile full
+  sudo ./install.sh --with-kali-repo          # Debian / Raspberry Pi
+  sudo ./install.sh --profile full --with-kali-repo --with-tor
 EOF
 }
 
@@ -67,6 +74,12 @@ while [ "$#" -gt 0 ]; do
             ;;
         --with-tor)
             WITH_TOR=1
+            ;;
+        --with-kali-repo)
+            WITH_KALI_REPO=1
+            ;;
+        --with-chaotic-aur)
+            WITH_CHAOTIC_AUR=1
             ;;
         --no-tools)
             NO_TOOLS=1
@@ -130,6 +143,8 @@ if [ "$WITH_TOR" -eq 1 ] || [ "$PROFILE" = "full" ]; then
 else
     echo -e "Tor setup       : ${DIM}skipped${NC}"
 fi
+[ "$WITH_KALI_REPO"   -eq 1 ] && echo -e "Kali repo       : ${GREEN}enabled${NC}"
+[ "$WITH_CHAOTIC_AUR" -eq 1 ] && echo -e "Chaotic-AUR     : ${GREEN}enabled${NC}"
 [ -n "$ORIG_USER" ] && echo -e "Sudo user       : ${GREEN}${ORIG_USER}${NC}"
 echo ""
 
@@ -339,9 +354,15 @@ standard_packages() {
     case "$PM" in
         pacman)
             printf '%s\n' whois bind nmap masscan gobuster wafw00f whatweb nikto testssl.sh sslscan sqlmap python-impacket hashcat john hydra aircrack-ng tcpdump curl
+            if [ "$WITH_CHAOTIC_AUR" -eq 1 ]; then
+                printf '%s\n' bettercap amass
+            fi
             ;;
         apt)
             printf '%s\n' whois dnsutils nmap masscan gobuster wafw00f whatweb nikto sslscan sqlmap python3-impacket hashcat john hydra aircrack-ng tcpdump curl
+            if [ "$WITH_KALI_REPO" -eq 1 ]; then
+                printf '%s\n' netexec bettercap wpscan amass
+            fi
             ;;
         dnf)
             printf '%s\n' whois bind-utils nmap masscan nikto sslscan sqlmap hashcat john hydra aircrack-ng tcpdump curl
@@ -363,6 +384,91 @@ tor_packages() {
         zypper) printf '%s\n' tor proxychains-ng curl ;;
         apk) printf '%s\n' tor proxychains-ng curl ;;
     esac
+}
+
+setup_kali_repo() {
+    [ "$PM" = "apt" ] || return 0
+    [ "$WITH_KALI_REPO" -eq 1 ] || return 0
+
+    local keyring="/etc/apt/keyrings/kali-archive-keyring.gpg"
+    local sources_list="/etc/apt/sources.list.d/kali.list"
+    local pref_file="/etc/apt/preferences.d/kali.pref"
+
+    if [ -f "$sources_list" ]; then
+        echo -e "  ${DIM}Kali rolling repo already configured${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}[*] Adding Kali rolling repo (priority 100 — Debian packages stay preferred)${NC}"
+    command -v curl >/dev/null 2>&1 || pm_install curl
+
+    mkdir -p /etc/apt/keyrings
+    if ! curl -fsSL https://archive.kali.org/archive-key.asc | gpg --dearmor -o "$keyring" 2>/dev/null; then
+        echo -e "${YELLOW}[!] Failed to download Kali GPG key — skipping Kali repo.${NC}"
+        return 1
+    fi
+    chmod 644 "$keyring"
+    manifest_record "file:${keyring}"
+
+    echo "deb [signed-by=${keyring}] http://http.kali.org/kali kali-rolling main contrib non-free non-free-firmware" \
+        > "$sources_list"
+    manifest_record "file:${sources_list}"
+
+    mkdir -p /etc/apt/preferences.d
+    cat > "$pref_file" << 'EOF'
+Package: *
+Pin: release a=kali-rolling
+Pin-Priority: 100
+EOF
+    manifest_record "file:${pref_file}"
+
+    REFRESH_DONE=0
+    pm_refresh || true
+    echo -e "${GREEN}[+] Kali rolling repo added${NC}"
+}
+
+setup_chaotic_aur() {
+    [ "$PM" = "pacman" ] || return 0
+    [ "$WITH_CHAOTIC_AUR" -eq 1 ] || return 0
+
+    if pacman-key --list-keys 3056513887B78AEB >/dev/null 2>&1 && \
+       grep -q "chaotic-aur" /etc/pacman.conf 2>/dev/null; then
+        echo -e "  ${DIM}Chaotic-AUR already configured${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}[*] Adding Chaotic-AUR repo${NC}"
+    local keyring="/usr/share/chaotic-keyring/chaotic.gpg"
+    local mirrorlist="/etc/pacman.d/chaotic-mirrorlist"
+    local conf_entry="/etc/pacman.conf"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        pm_install curl
+    fi
+
+    pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com 2>/dev/null || \
+    pacman-key --recv-key 3056513887B78AEB --keyserver hkps://keys.openpgp.org 2>/dev/null
+    pacman-key --lsign-key 3056513887B78AEB 2>/dev/null || {
+        echo -e "${YELLOW}[!] Could not sign Chaotic-AUR key — skipping.${NC}"
+        return 1
+    }
+
+    if pacman -U --noconfirm \
+        "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst" \
+        "https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-mirrorlist.pkg.tar.zst" 2>/dev/null; then
+        if ! grep -q "\[chaotic-aur\]" "$conf_entry" 2>/dev/null; then
+            printf '\n[chaotic-aur]\nInclude = /etc/pacman.d/chaotic-mirrorlist\n' >> "$conf_entry"
+        fi
+        manifest_record "file:/usr/share/chaotic-keyring/chaotic.gpg"
+        manifest_record "file:/etc/pacman.d/chaotic-mirrorlist"
+        manifest_record "repo:pacman:/etc/pacman.conf:chaotic-aur"
+        REFRESH_DONE=0
+        pm_refresh || true
+        echo -e "${GREEN}[+] Chaotic-AUR repo added${NC}"
+    else
+        echo -e "${YELLOW}[!] Chaotic-AUR setup failed — continuing without it.${NC}"
+        return 1
+    fi
 }
 
 setup_epel() {
@@ -687,6 +793,8 @@ PY
 
 install_python_runtime
 manifest_init
+setup_kali_repo
+setup_chaotic_aur
 setup_epel
 
 if [ "$NO_TOOLS" -eq 0 ]; then

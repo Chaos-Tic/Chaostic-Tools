@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ChaosticTool uninstaller — reads /var/lib/chaostictool/manifest to remove only what install.sh installed
+# ChaosticTool uninstaller — reads /var/lib/chaostictool/manifest; falls back to detection when absent
 set -Eeuo pipefail
 
 GREEN='\033[1;32m'; RED='\033[1;31m'; CYAN='\033[1;36m'; YELLOW='\033[1;33m'; DIM='\033[2m'; NC='\033[0m'
@@ -14,14 +14,6 @@ if [ "$(id -u)" -ne 0 ]; then
     echo -e "${RED}[!] This script requires root privileges.${NC}"
     echo -e "    Re-run with: ${GREEN}sudo ./uninstall.sh${NC}\n"
     exit 1
-fi
-
-if [ ! -f "$MANIFEST" ]; then
-    echo -e "${YELLOW}[!] No manifest found at $MANIFEST${NC}"
-    echo -e "    Either ChaosticTool was never installed via install.sh, or it was installed"
-    echo -e "    before the manifest system was introduced (v1.3.2+)."
-    echo -e "    Nothing to remove.\n"
-    exit 0
 fi
 
 ORIG_USER="${SUDO_USER:-}"
@@ -69,6 +61,177 @@ _rm_dir() {
 }
 
 # ---------------------------------------------------------------------------
+# Detection mode — used when no manifest is present (pre-v1.3.2 installs)
+# ---------------------------------------------------------------------------
+detect_and_remove() {
+    echo -e "${YELLOW}[!] Running in detection mode (no manifest).${NC}"
+    echo -e "    Only known ChaosticTool artefacts will be offered for removal.\n"
+
+    # --- Launcher ---
+    echo -e "\n${CYAN}[D1] Launcher${NC}"
+    _rm_file /usr/local/bin/chaostictool
+
+    # --- Source-install wrappers ---
+    echo -e "\n${CYAN}[D2] Source-install wrappers${NC}"
+    for name in responder whatweb xsstrike; do
+        path="/usr/local/bin/$name"
+        if [ -f "$path" ] && grep -q "opt/chaostictool" "$path" 2>/dev/null; then
+            _rm_file "$path"
+        else
+            echo -e "  ${DIM}[-] not a ChaosticTool wrapper: $name${NC}"
+            SKIPPED=$((SKIPPED + 1))
+        fi
+    done
+
+    # --- Python-module wrappers ---
+    echo -e "\n${CYAN}[D3] Python-module wrappers${NC}"
+    for name in secretsdump.py psexec.py GetUserSPNs.py; do
+        path="/usr/local/bin/$name"
+        if [ -f "$path" ] && grep -q "impacket" "$path" 2>/dev/null; then
+            _rm_file "$path"
+        else
+            echo -e "  ${DIM}[-] not a ChaosticTool wrapper: $name${NC}"
+            SKIPPED=$((SKIPPED + 1))
+        fi
+    done
+
+    # --- Direct downloads ---
+    echo -e "\n${CYAN}[D4] Direct downloads${NC}"
+    for f in /usr/local/bin/linpeas.sh /usr/local/bin/winpeas.exe; do
+        _rm_file "$f"
+    done
+    if [ -f /usr/local/bin/rustscan ] && [ ! -L /usr/local/bin/rustscan ]; then
+        _rm_file /usr/local/bin/rustscan
+    fi
+
+    # --- Symlinks to user-local tool dirs ---
+    echo -e "\n${CYAN}[D5] Symlinks to user-local binaries${NC}"
+    for p in /usr/local/bin/*; do
+        [ -L "$p" ] || continue
+        target="$(readlink "$p")"
+        if echo "$target" | grep -qE "^/(home/[^/]+|root)/(go/bin|\.local/share/go/bin|\.cargo/bin|\.local/bin)/"; then
+            _rm_file "$p"
+        fi
+    done
+
+    # --- Source checkouts ---
+    echo -e "\n${CYAN}[D6] Source checkouts${NC}"
+    _rm_dir /opt/chaostictool
+    _rm_dir /var/cache/chaostictool
+
+    # --- Tor/proxychains ---
+    echo -e "\n${CYAN}[D7] Tor/proxychains config restore${NC}"
+    for bak in /etc/tor/torrc.chaostictool.bak \
+               /etc/proxychains.conf.chaostictool.bak \
+               /etc/proxychains4.conf.chaostictool.bak; do
+        if [ -f "$bak" ]; then
+            original="${bak%.chaostictool.bak}"
+            cp -- "$bak" "$original"
+            rm -f "$bak"
+            echo -e "  ${GREEN}[+] restored:${NC} $original"
+            REMOVED=$((REMOVED + 1))
+        fi
+    done
+
+    # --- User-local tools ---
+    echo -e "\n${CYAN}[D8] User-local tools (Go/Cargo/pipx/gem)${NC}"
+    _detect_user_tools
+}
+
+_detect_user_tools() {
+    local GO_BINS=(subfinder amass httpx nuclei naabu katana gau waybackurls ffuf dalfox gobuster bettercap)
+    local go_found=()
+    for bin in "${GO_BINS[@]}"; do
+        for dir in "$ORIG_HOME/go/bin" "$ORIG_HOME/.local/share/go/bin" "/root/go/bin"; do
+            [ -f "$dir/$bin" ] && go_found+=("$dir/$bin")
+        done
+    done
+    if [ "${#go_found[@]}" -gt 0 ]; then
+        echo -e "  ${YELLOW}Go binaries found:${NC}"
+        for f in "${go_found[@]}"; do echo -e "    $f"; done
+        if confirm "  Remove these Go binaries?"; then
+            for f in "${go_found[@]}"; do rm -f "$f"; REMOVED=$((REMOVED + 1)); done
+        fi
+    fi
+
+    local CARGO_BINS=(rustscan)
+    local cargo_found=()
+    for bin in "${CARGO_BINS[@]}"; do
+        for dir in "$ORIG_HOME/.cargo/bin" "/root/.cargo/bin"; do
+            [ -f "$dir/$bin" ] && cargo_found+=("$dir/$bin")
+        done
+    done
+    if [ "${#cargo_found[@]}" -gt 0 ]; then
+        echo -e "  ${YELLOW}Cargo binaries found:${NC}"
+        for f in "${cargo_found[@]}"; do echo -e "    $f"; done
+        if confirm "  Remove these Cargo binaries?"; then
+            for f in "${cargo_found[@]}"; do rm -f "$f"; REMOVED=$((REMOVED + 1)); done
+        fi
+    fi
+
+    local PIPX_NAMES=(theHarvester impacket netexec)
+    if command -v pipx >/dev/null 2>&1; then
+        local pipx_list
+        pipx_list=$(if [ -n "$ORIG_USER" ] && [ "$ORIG_USER" != "root" ]; then
+            sudo -u "$ORIG_USER" pipx list 2>/dev/null || true
+        else
+            pipx list 2>/dev/null || true
+        fi)
+        local pipx_ours=()
+        for pkg in "${PIPX_NAMES[@]}"; do
+            echo "$pipx_list" | grep -qi "package $pkg" && pipx_ours+=("$pkg")
+        done
+        if [ "${#pipx_ours[@]}" -gt 0 ]; then
+            echo -e "  ${YELLOW}pipx packages:${NC}"
+            for p in "${pipx_ours[@]}"; do echo -e "    $p"; done
+            if confirm "  Uninstall these pipx packages?"; then
+                for p in "${pipx_ours[@]}"; do
+                    if [ -n "$ORIG_USER" ] && [ "$ORIG_USER" != "root" ]; then
+                        sudo -u "$ORIG_USER" pipx uninstall "$p" 2>/dev/null || true
+                    else
+                        pipx uninstall "$p" 2>/dev/null || true
+                    fi
+                    REMOVED=$((REMOVED + 1))
+                done
+            fi
+        fi
+    fi
+
+    if command -v gem >/dev/null 2>&1 && gem list wpscan 2>/dev/null | grep -q wpscan; then
+        if confirm "  Uninstall wpscan via gem?"; then
+            gem uninstall wpscan --executables --all 2>/dev/null || true
+            REMOVED=$((REMOVED + 1))
+        fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# No manifest → detection fallback
+# ---------------------------------------------------------------------------
+if [ ! -f "$MANIFEST" ]; then
+    echo -e "${YELLOW}[!] No manifest found at $MANIFEST${NC}"
+    echo -e "    This installation predates the manifest system (v1.3.2+)."
+    echo ""
+    echo -e "  Option 1: re-run ${GREEN}sudo ./install.sh${NC} — it will generate a manifest,"
+    echo -e "            then run this script again for a clean removal."
+    echo -e "  Option 2: run detection mode now — scans for known ChaosticTool"
+    echo -e "            artefacts and offers to remove them."
+    echo ""
+    if ! confirm "Run detection mode now?"; then
+        echo -e "${DIM}Aborted.${NC}"
+        exit 0
+    fi
+    detect_and_remove
+    echo -e "\n${CYAN}=== Summary ===${NC}"
+    echo -e "  Removed : ${GREEN}${REMOVED}${NC}"
+    echo -e "  Skipped : ${DIM}${SKIPPED}${NC}"
+    echo ""
+    echo -e "${DIM}The project directory was not touched: ${SCRIPT_DIR}${NC}"
+    echo -e "${DIM}To fully remove it: sudo rm -rf ${SCRIPT_DIR}${NC}"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Parse manifest into typed arrays
 # ---------------------------------------------------------------------------
 declare -a M_FILES=()
@@ -78,37 +241,53 @@ declare -a M_GO=()
 declare -a M_CARGO=()
 declare -a M_PIPX=()
 declare -a M_GEM=()
-declare -a M_TORRC=()
-declare -a M_PROXYCHAINS=()
-# pkg entries: "pm:pkgname" — collected for display only (never auto-removed)
+declare -a M_REPOS=()
 declare -a M_PKGS=()
 
 while IFS= read -r line; do
     [[ "$line" =~ ^# ]] && continue
     [[ -z "$line" ]] && continue
     case "$line" in
-        file:*)       M_FILES+=("${line#file:}") ;;
-        symlink:*)    M_SYMLINKS+=("${line#symlink:}") ;;
-        dir:*)        M_DIRS+=("${line#dir:}") ;;
-        go:*)         M_GO+=("${line#go:}") ;;
-        cargo:*)      M_CARGO+=("${line#cargo:}") ;;
-        pipx:*)       M_PIPX+=("${line#pipx:}") ;;
-        gem:*)        M_GEM+=("${line#gem:}") ;;
-        torrc:*)      M_TORRC+=("${line#torrc:}") ;;
-        proxychains:*)M_PROXYCHAINS+=("${line#proxychains:}") ;;
-        pkg:*)        M_PKGS+=("${line#pkg:}") ;;
+        file:*)        M_FILES+=("${line#file:}") ;;
+        symlink:*)     M_SYMLINKS+=("${line#symlink:}") ;;
+        dir:*)         M_DIRS+=("${line#dir:}") ;;
+        go:*)          M_GO+=("${line#go:}") ;;
+        cargo:*)       M_CARGO+=("${line#cargo:}") ;;
+        pipx:*)        M_PIPX+=("${line#pipx:}") ;;
+        gem:*)         M_GEM+=("${line#gem:}") ;;
+        repo:*)        M_REPOS+=("${line#repo:}") ;;
+        torrc:*)       M_FILES+=("/etc/tor/torrc.chaostictool.bak") ;;  # triggers restore
+        proxychains:*) M_FILES+=("${line#proxychains:}.chaostictool.bak 2>/dev/null || true") ;;
+        pkg:*)         M_PKGS+=("${line#pkg:}") ;;
     esac
 done < "$MANIFEST"
 
 # ---------------------------------------------------------------------------
 echo -e "\n${CYAN}[1] Files installed by ChaosticTool${NC}"
+
+APT_SOURCES_REMOVED=0
+
 if [ "${#M_FILES[@]}" -gt 0 ]; then
     for path in "${M_FILES[@]}"; do
         _rm_file "$path"
+        # Track if an apt sources list was removed (to refresh later)
+        [[ "$path" == /etc/apt/sources.list.d/*.list ]] && APT_SOURCES_REMOVED=1 || true
     done
 else
     echo -e "  ${DIM}No files recorded.${NC}"
 fi
+
+# Restore Tor/proxychains from backups
+for bak in /etc/tor/torrc.chaostictool.bak \
+           /etc/proxychains.conf.chaostictool.bak \
+           /etc/proxychains4.conf.chaostictool.bak; do
+    [ -f "$bak" ] || continue
+    original="${bak%.chaostictool.bak}"
+    cp -- "$bak" "$original"
+    rm -f "$bak"
+    echo -e "  ${GREEN}[+] restored:${NC} $original"
+    REMOVED=$((REMOVED + 1))
+done
 
 # ---------------------------------------------------------------------------
 echo -e "\n${CYAN}[2] Symlinks to user-local binaries${NC}"
@@ -124,7 +303,6 @@ fi
 echo -e "\n${CYAN}[3] Source checkouts and staging directories${NC}"
 if [ "${#M_DIRS[@]}" -gt 0 ]; then
     for path in "${M_DIRS[@]}"; do
-        # Never auto-remove the manifest dir itself — handled last
         [ "$path" = "$MANIFEST_DIR" ] && continue
         _rm_dir "$path"
     done
@@ -133,37 +311,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo -e "\n${CYAN}[4] Restoring Tor and proxychains configurations${NC}"
-_restore_bak() {
-    local bak="$1"
-    if [ -f "$bak" ]; then
-        local original="${bak%.chaostictool.bak}"
-        cp -- "$bak" "$original"
-        rm -f "$bak"
-        echo -e "  ${GREEN}[+] restored:${NC} $original"
-        REMOVED=$((REMOVED + 1))
-    else
-        echo -e "  ${DIM}[-] no backup: $bak${NC}"
-        SKIPPED=$((SKIPPED + 1))
-    fi
-}
-for bak in /etc/tor/torrc.chaostictool.bak \
-           /etc/proxychains.conf.chaostictool.bak \
-           /etc/proxychains4.conf.chaostictool.bak; do
-    _restore_bak "$bak"
-done
+echo -e "\n${CYAN}[4] Extra package sources${NC}"
+if [ "${#M_REPOS[@]}" -gt 0 ]; then
+    for entry in "${M_REPOS[@]}"; do
+        # Format: pm:conftype:path  e.g. pacman:/etc/pacman.conf:chaotic-aur
+        local_pm="${entry%%:*}"
+        rest="${entry#*:}"
+        repo_path="${rest%%:*}"
+        repo_id="${rest#*:}"
+        if [ "$local_pm" = "pacman" ] && [ -f "$repo_path" ]; then
+            # Remove [chaotic-aur] block from pacman.conf
+            sed -i "/^\[${repo_id}\]/,/^$/d" "$repo_path" 2>/dev/null || true
+            echo -e "  ${GREEN}[+] removed repo section:${NC} [${repo_id}] from $repo_path"
+            REMOVED=$((REMOVED + 1))
+        fi
+    done
+else
+    echo -e "  ${DIM}No extra sources recorded.${NC}"
+fi
+
+# Refresh package index if apt sources were removed
+if [ "$APT_SOURCES_REMOVED" -eq 1 ] && command -v apt >/dev/null 2>&1; then
+    echo -e "  ${CYAN}[*] Refreshing apt after source removal${NC}"
+    apt update -qq 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 echo -e "\n${CYAN}[5] User-local tools (Go, Cargo, pipx, gem)${NC}"
 
-# --- Go binaries ---
 if [ "${#M_GO[@]}" -gt 0 ]; then
     echo -e "  ${YELLOW}Go binaries installed by ChaosticTool:${NC}"
     for path in "${M_GO[@]}"; do echo -e "    $path"; done
     if confirm "  Remove these Go binaries?"; then
-        for path in "${M_GO[@]}"; do
-            _rm_file "$path"
-        done
+        for path in "${M_GO[@]}"; do _rm_file "$path"; done
     else
         SKIPPED=$((SKIPPED + ${#M_GO[@]}))
     fi
@@ -171,14 +351,11 @@ else
     echo -e "  ${DIM}No Go binaries recorded.${NC}"
 fi
 
-# --- Cargo binaries ---
 if [ "${#M_CARGO[@]}" -gt 0 ]; then
     echo -e "  ${YELLOW}Cargo binaries installed by ChaosticTool:${NC}"
     for path in "${M_CARGO[@]}"; do echo -e "    $path"; done
     if confirm "  Remove these Cargo binaries?"; then
-        for path in "${M_CARGO[@]}"; do
-            _rm_file "$path"
-        done
+        for path in "${M_CARGO[@]}"; do _rm_file "$path"; done
     else
         SKIPPED=$((SKIPPED + ${#M_CARGO[@]}))
     fi
@@ -186,7 +363,6 @@ else
     echo -e "  ${DIM}No Cargo binaries recorded.${NC}"
 fi
 
-# --- pipx packages ---
 if [ "${#M_PIPX[@]}" -gt 0 ]; then
     echo -e "  ${YELLOW}pipx packages installed by ChaosticTool:${NC}"
     for pkg in "${M_PIPX[@]}"; do echo -e "    $pkg"; done
@@ -207,7 +383,6 @@ else
     echo -e "  ${DIM}No pipx packages recorded.${NC}"
 fi
 
-# --- gem packages ---
 if [ "${#M_GEM[@]}" -gt 0 ]; then
     echo -e "  ${YELLOW}gem packages installed by ChaosticTool:${NC}"
     for pkg in "${M_GEM[@]}"; do echo -e "    $pkg"; done
@@ -229,8 +404,7 @@ fi
 # ---------------------------------------------------------------------------
 echo -e "\n${CYAN}[6] System packages — review manually${NC}"
 if [ "${#M_PKGS[@]}" -gt 0 ]; then
-    echo -e "  ${DIM}These packages were installed by ChaosticTool. They are NOT removed${NC}"
-    echo -e "  ${DIM}automatically — remove only what you no longer need:${NC}\n"
+    echo -e "  ${DIM}These packages were installed by ChaosticTool. Remove only what you no longer need:${NC}\n"
     declare -A by_pm=()
     for entry in "${M_PKGS[@]}"; do
         pm="${entry%%:*}"
