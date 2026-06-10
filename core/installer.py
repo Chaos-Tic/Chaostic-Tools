@@ -32,6 +32,25 @@ THEME = Theme(
 console = Console(theme=THEME)
 
 
+def _manifest_record(entry: str) -> None:
+    path = os.environ.get("CHAOSTICTOOL_MANIFEST", "")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(entry + "\n")
+    except OSError:
+        pass
+
+
+# Maps pipx install target → canonical package name used by `pipx uninstall`
+_PIPX_CANONICAL: dict[str, str] = {
+    "git+https://github.com/laramies/theHarvester.git": "theHarvester",
+    "impacket": "impacket",
+    "git+https://github.com/Pennyw0rth/NetExec": "netexec",
+}
+
+
 def _get_original_user():
     """Returns (username, pw_entry) of the user who ran sudo, or None."""
     user = os.environ.get("SUDO_USER", "")
@@ -504,6 +523,7 @@ def _install_aur_direct(pkg_names, orig_user, orig_pw):
 
             r = subprocess.run(["pacman", "-U", "--noconfirm", "--needed"] + built_dst)
             if r.returncode == 0:
+                _manifest_record(f"pkg:pacman:{pkg_name}")
                 console.print(f"[brand.ok][+] {pkg_name} installed[/brand.ok]")
             else:
                 console.print(f"[brand.red][!] pacman -U failed for {pkg_name}[/brand.red]")
@@ -663,6 +683,7 @@ def _link_user_binary(binary, dirs):
             try:
                 os.makedirs("/usr/local/bin", exist_ok=True)
                 os.symlink(src, dst)
+                _manifest_record(f"symlink:{dst}")
                 console.print(f"[brand.ok][+] linked {binary} -> {dst}[/brand.ok]")
                 return True
             except OSError as e:
@@ -687,6 +708,7 @@ def _install_direct_download(binary, spec):
             fh.write(data)
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
+        _manifest_record(f"file:{path}")
         console.print(f"[brand.ok][+] {binary} -> {path}[/brand.ok]")
         return True
     except (OSError, urllib.error.URLError) as e:
@@ -803,6 +825,7 @@ def _install_release_asset(binary, spec):
             fh.write(payload)
         os.chmod(tmp_path, 0o755)
         os.replace(tmp_path, path)
+        _manifest_record(f"file:{path}")
         console.print(f"[brand.ok][+] {binary} -> {path}[/brand.ok]")
         return True
     except (OSError, urllib.error.URLError, KeyError, json.JSONDecodeError) as e:
@@ -851,6 +874,8 @@ def _install_source_tool(binary, spec):
             fh.write(f"exec {shlex.quote(runner)} {shlex.quote(entry_path)} \"$@\"\n")
         os.chmod(tmp_wrapper, 0o755)
         os.replace(tmp_wrapper, wrapper)
+        _manifest_record(f"dir:{path}")
+        _manifest_record(f"file:{wrapper}")
         console.print(f"[brand.ok][+] {binary} -> {wrapper}[/brand.ok]")
         return True
     except OSError as e:
@@ -890,6 +915,7 @@ def _install_python_module_wrapper(binary, spec):
             fh.write(f"exec {shlex.quote(python_bin)} -m {shlex.quote(module)} \"$@\"\n")
         os.chmod(tmp_wrapper, 0o755)
         os.replace(tmp_wrapper, wrapper)
+        _manifest_record(f"file:{wrapper}")
         console.print(f"[brand.ok][+] {binary} -> {wrapper}[/brand.ok]")
         return True
     except OSError as e:
@@ -1059,6 +1085,8 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
         if not cmd:
             return False
         if _run(cmd):
+            for _p in kept:
+                _manifest_record(f"pkg:{method}:{_p}")
             return True
         if retry_metadata and _recover_package_metadata(method):
             kept = _filter_installable_packages(method, kept)
@@ -1125,6 +1153,7 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
                 env["PATH"] = f"{env['GOBIN']}:/usr/local/go/bin:{env.get('PATH','')}"
             ok = _run([go_bin, "install", pkg], as_user_pw=orig_pw, env=env)
             if ok and orig_pw:
+                _manifest_record(f"go:{os.path.join(env['GOBIN'], binary)}")
                 _link_user_binary(binary, [env["GOBIN"]])
             return ok
 
@@ -1141,6 +1170,7 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
                 env["PATH"] = f"{env['CARGO_HOME']}/bin:{env.get('PATH','')}"
             ok = _run([cargo_bin, "install", pkg], as_user_pw=orig_pw, env=env)
             if ok and orig_pw:
+                _manifest_record(f"cargo:{os.path.join(env['CARGO_HOME'], 'bin', binary)}")
                 _link_user_binary(binary, [os.path.join(env["CARGO_HOME"], "bin")])
             return ok
 
@@ -1164,6 +1194,8 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
                 env["PIPX_BIN_DIR"] = os.path.join(orig_pw.pw_dir, ".local", "bin")
             if pkg not in pipx_results:
                 pipx_results[pkg] = _run([pipx_bin, "install", "--force", pkg], as_user_pw=orig_pw, env=env)
+                if pipx_results[pkg]:
+                    _manifest_record(f"pipx:{_PIPX_CANONICAL.get(pkg, pkg)}")
             if pipx_results[pkg] and orig_pw:
                 _link_user_binary(binary, [os.path.join(orig_pw.pw_dir, ".local", "bin")])
             return pipx_results[pkg]
@@ -1187,7 +1219,10 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
             _install_build_deps(binary, pm)
             _install_runtime("gem", {"pacman": "ruby", "apt": "ruby-full", "dnf": "ruby"})
             gem_bin = shutil.which("gem")
-            return _run([gem_bin, "install", pkg]) if gem_bin else False
+            if gem_bin and _run([gem_bin, "install", pkg]):
+                _manifest_record(f"gem:{pkg}")
+                return True
+            return False
 
         if method == "source":
             _install_build_deps(binary, pm)
@@ -1242,6 +1277,7 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
                 if _run([go_bin, "install", module], as_user_pw=orig_pw, env=env):
                     console.print(f"[brand.ok][+] {binary} -> ~/go/bin/[/brand.ok]")
                     if orig_pw:
+                        _manifest_record(f"go:{os.path.join(env['GOBIN'], binary)}")
                         _link_user_binary(binary, [env["GOBIN"]])
 
     # --- cargo install — drop root, Cargo home of the original user ---
@@ -1263,6 +1299,7 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
                 if _run([cargo_bin, "install", pkg], as_user_pw=orig_pw, env=env):
                     console.print(f"[brand.ok][+] {binary} -> ~/.cargo/bin/[/brand.ok]")
                     if orig_pw:
+                        _manifest_record(f"cargo:{os.path.join(env['CARGO_HOME'], 'bin', binary)}")
                         _link_user_binary(binary, [os.path.join(env["CARGO_HOME"], "bin")])
 
     # --- Python module wrappers for distro packages that expose modules but not every script name ---
@@ -1295,6 +1332,8 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
                         env["PIPX_HOME"] = os.path.join(orig_pw.pw_dir, ".local", "share", "pipx")
                         env["PIPX_BIN_DIR"] = os.path.join(orig_pw.pw_dir, ".local", "bin")
                     pipx_results[pkg] = _run([pipx_bin, "install", "--force", pkg], as_user_pw=orig_pw, env=env)
+                    if pipx_results[pkg]:
+                        _manifest_record(f"pipx:{_PIPX_CANONICAL.get(pkg, pkg)}")
                 if pipx_results[pkg] and orig_pw:
                     _link_user_binary(binary, [os.path.join(orig_pw.pw_dir, ".local", "bin")])
 
@@ -1325,7 +1364,8 @@ def install_missing(missing_items, assume_yes=False, allowed_methods=None):
         else:
             for binary, pkg in groups["gem"]:
                 console.print(f"\n[brand.info][*] gem install {pkg}[/brand.info]")
-                _run([gem_bin, "install", pkg])
+                if _run([gem_bin, "install", pkg]):
+                    _manifest_record(f"gem:{pkg}")
 
     # --- source checkouts with stable local wrappers ---
     if groups["source"]:

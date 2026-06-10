@@ -13,6 +13,9 @@ ASSUME_YES=0
 NO_TOOLS=0
 REFRESH_DONE=0
 
+MANIFEST_DIR="/var/lib/chaostictool"
+MANIFEST="$MANIFEST_DIR/manifest"
+
 usage() {
     cat <<EOF
 ChaosticTool installer
@@ -129,6 +132,18 @@ else
 fi
 [ -n "$ORIG_USER" ] && echo -e "Sudo user       : ${GREEN}${ORIG_USER}${NC}"
 echo ""
+
+manifest_init() {
+    mkdir -p "$MANIFEST_DIR"
+    printf '# ChaosticTool manifest\n# date=%s profile=%s pm=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PROFILE" "${PM:-none}" >> "$MANIFEST"
+    manifest_record "dir:${MANIFEST_DIR}"
+    export CHAOSTICTOOL_MANIFEST="$MANIFEST"
+}
+
+manifest_record() {
+    printf '%s\n' "$1" >> "$MANIFEST"
+}
 
 confirm() {
     local prompt="$1"
@@ -259,6 +274,8 @@ install_packages() {
             for pkg in "${wanted[@]}"; do
                 if ! pm_install "$pkg"; then
                     failed=1
+                else
+                    manifest_record "pkg:${PM}:${pkg}"
                 fi
             done
             if [ "$failed" -eq 0 ]; then
@@ -271,6 +288,9 @@ install_packages() {
         echo -e "${YELLOW}[!] Some $label packages failed to install. Continuing with verification.${NC}"
         return 1
     fi
+    for pkg in "${wanted[@]}"; do
+        manifest_record "pkg:${PM}:${pkg}"
+    done
 }
 
 pip_install_requirements() {
@@ -355,7 +375,9 @@ setup_epel() {
     fi
     echo -e "${YELLOW}[!] EPEL not enabled — many security tools require it on RHEL/CentOS${NC}"
     if confirm "Enable EPEL now? (recommended)"; then
-        dnf install -y epel-release || true
+        if dnf install -y epel-release; then
+            manifest_record "pkg:dnf:epel-release"
+        fi
         REFRESH_DONE=0
         pm_refresh || true
     fi
@@ -536,7 +558,11 @@ setup_tor() {
     install_packages "Tor routing" "${packages[@]}" || true
     echo -e "${DIM}[*] /etc/tor/torrc and /etc/proxychains*.conf will be updated. Originals backed up as *.chaostictool.bak${NC}"
     configure_torrc || true
+    manifest_record "torrc:/etc/tor/torrc"
     configure_proxychains || true
+    for _conf in /etc/proxychains.conf /etc/proxychains4.conf; do
+        [ -f "$_conf" ] && manifest_record "proxychains:${_conf}"
+    done
     start_tor_service || true
     echo ""
 }
@@ -578,6 +604,7 @@ install_launcher() {
     install -m 0755 "$tmp" /usr/local/bin/chaostictool
     rm -f "$tmp"
     chmod +x "$SCRIPT_DIR/chaostictool.py" "$SCRIPT_DIR/install.sh"
+    manifest_record "file:/usr/local/bin/chaostictool"
     echo -e "${GREEN}[+] Launcher installed: /usr/local/bin/chaostictool${NC}"
 }
 
@@ -614,6 +641,7 @@ for home in homes:
         home / ".local" / "bin",
     ])
 
+manifest_path = os.environ.get("CHAOSTICTOOL_MANIFEST", "")
 linked = 0
 Path("/usr/local/bin").mkdir(parents=True, exist_ok=True)
 for name in sorted(names):
@@ -628,6 +656,9 @@ for name in sorted(names):
             try:
                 dst.symlink_to(src)
                 linked += 1
+                if manifest_path:
+                    with open(manifest_path, "a", encoding="utf-8") as _mf:
+                        _mf.write(f"symlink:{dst}\n")
             except OSError:
                 pass
             break
@@ -655,6 +686,7 @@ PY
 }
 
 install_python_runtime
+manifest_init
 setup_epel
 
 if [ "$NO_TOOLS" -eq 0 ]; then
