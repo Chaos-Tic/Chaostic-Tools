@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="Banner.png" alt="ChaosticTool - Red Ops Control Surface" width="100%" />
+<img src="assets/Banner.png" alt="ChaosticTool - Red Ops Control Surface" width="100%" />
 
 # ChaosticTool
 
