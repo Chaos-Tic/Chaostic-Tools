@@ -31,7 +31,7 @@ MODULES = {
     "5":  "05_exploitation",
     "6":  "06_postexploit",
     "7":  "07_passwords",
-    # 8 = Windows/AD — géré directement par ad_menu()
+    "8":  "08_windows",
     "9":  "09_wireless",
     "10": "10_network",
 }
@@ -75,14 +75,6 @@ def main_menu():
     return ui.menu("Main Menu", MAIN_ENTRIES, footer_extra=ui.context_footer(), show_back=False)
 
 
-# Windows/AD reuses the impacket/cme/bloodhound tools from post-exploit
-AD_TOOLS = ["secretsdump.py", "psexec.py", "GetUserSPNs.py", "crackmapexec", "bloodhound-python"]
-
-
-def ad_menu():
-    ui.category_menu("Windows / Active Directory", AD_TOOLS)
-
-
 def main():
     if os.geteuid() != 0:
         print("\n[!] This script requires root privileges.")
@@ -104,8 +96,6 @@ def main():
             session.view_results()
         elif choice == "12":
             flows.flow_menu()
-        elif choice == "8":
-            ad_menu()
         elif choice in MODULES:
             try:
                 mod = load_module(MODULES[choice])
